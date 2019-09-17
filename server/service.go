@@ -29,7 +29,7 @@ import (
 	"time"
 
 	"github.com/fatedier/frp/assets"
-	"github.com/fatedier/frp/g"
+	"github.com/fatedier/frp/models/config"
 	"github.com/fatedier/frp/models/msg"
 	"github.com/fatedier/frp/models/nathole"
 	"github.com/fatedier/frp/server/controller"
@@ -50,8 +50,6 @@ import (
 const (
 	connReadTimeout time.Duration = 10 * time.Second
 )
-
-var ServerService *Service
 
 // Server service
 type Service struct {
@@ -76,6 +74,9 @@ type Service struct {
 	// Manage all proxies
 	pxyManager *proxy.ProxyManager
 
+	// HTTP vhost router
+	httpVhostRouter *vhost.VhostRouters
+
 	// All resource managers and controllers
 	rc *controller.ResourceController
 
@@ -83,10 +84,11 @@ type Service struct {
 	statsCollector stats.Collector
 
 	tlsConfig *tls.Config
+
+	cfg config.ServerCommonConf
 }
 
-func NewService() (svr *Service, err error) {
-	cfg := &g.GlbServerCfg.ServerCommonConf
+func NewService(cfg config.ServerCommonConf) (svr *Service, err error) {
 	svr = &Service{
 		ctlManager: NewControlManager(),
 		pxyManager: proxy.NewProxyManager(),
@@ -95,18 +97,16 @@ func NewService() (svr *Service, err error) {
 			TcpPortManager: ports.NewPortManager("tcp", cfg.ProxyBindAddr, cfg.AllowPorts),
 			UdpPortManager: ports.NewPortManager("udp", cfg.ProxyBindAddr, cfg.AllowPorts),
 		},
-		tlsConfig: generateTLSConfig(),
+		httpVhostRouter: vhost.NewVhostRouters(),
+		tlsConfig:       generateTLSConfig(),
+		cfg:             cfg,
 	}
 
 	// Init group controller
 	svr.rc.TcpGroupCtl = group.NewTcpGroupCtl(svr.rc.TcpPortManager)
 
-	// Init assets
-	err = assets.Load(cfg.AssetsDir)
-	if err != nil {
-		err = fmt.Errorf("Load assets error: %v", err)
-		return
-	}
+	// Init HTTP group controller
+	svr.rc.HTTPGroupCtl = group.NewHTTPGroupController(svr.httpVhostRouter)
 
 	// Init 404 not found page
 	vhost.NotFoundPagePath = cfg.Custom404Page
@@ -159,7 +159,7 @@ func NewService() (svr *Service, err error) {
 	if cfg.VhostHttpPort > 0 {
 		rp := vhost.NewHttpReverseProxy(vhost.HttpReverseProxyOptions{
 			ResponseHeaderTimeoutS: cfg.VhostHttpTimeout,
-		})
+		}, svr.httpVhostRouter)
 		svr.rc.HttpReverseProxy = rp
 
 		address := fmt.Sprintf("%s:%d", cfg.ProxyBindAddr, cfg.VhostHttpPort)
@@ -224,6 +224,13 @@ func NewService() (svr *Service, err error) {
 	var statsEnable bool
 	// Create dashboard web server.
 	if cfg.DashboardPort > 0 {
+		// Init dashboard assets
+		err = assets.Load(cfg.AssetsDir)
+		if err != nil {
+			err = fmt.Errorf("Load assets error: %v", err)
+			return
+		}
+
 		err = svr.RunDashboardServer(cfg.DashboardAddr, cfg.DashboardPort)
 		if err != nil {
 			err = fmt.Errorf("Create dashboard web server error, %v", err)
@@ -241,7 +248,7 @@ func (svr *Service) Run() {
 	if svr.rc.NatHoleController != nil {
 		go svr.rc.NatHoleController.Run()
 	}
-	if g.GlbServerCfg.KcpBindPort > 0 {
+	if svr.cfg.KcpBindPort > 0 {
 		go svr.HandleListener(svr.kcpListener)
 	}
 
@@ -259,7 +266,16 @@ func (svr *Service) HandleListener(l frpNet.Listener) {
 			log.Warn("Listener for incoming connections from client closed")
 			return
 		}
-		c = frpNet.CheckAndEnableTLSServerConn(c, svr.tlsConfig)
+
+		log.Trace("start check TLS connection...")
+		originConn := c
+		c, err = frpNet.CheckAndEnableTLSServerConnWithTimeout(c, svr.tlsConfig, connReadTimeout)
+		if err != nil {
+			log.Warn("CheckAndEnableTLSServerConnWithTimeout error: %v", err)
+			originConn.Close()
+			continue
+		}
+		log.Trace("success check TLS connection")
 
 		// Start a new goroutine for dealing connections.
 		go func(frpConn frpNet.Conn) {
@@ -308,7 +324,7 @@ func (svr *Service) HandleListener(l frpNet.Listener) {
 				}
 			}
 
-			if g.GlbServerCfg.TcpMux {
+			if svr.cfg.TcpMux {
 				fmuxCfg := fmux.DefaultConfig()
 				fmuxCfg.KeepAliveInterval = 20 * time.Second
 				fmuxCfg.LogOutput = ioutil.Discard
@@ -347,7 +363,7 @@ func (svr *Service) RegisterControl(ctlConn frpNet.Conn, loginMsg *msg.Login) (e
 	}
 
 	// Check auth.
-	if util.GetAuthKey(g.GlbServerCfg.Token, loginMsg.Timestamp) != loginMsg.PrivilegeKey {
+	if util.GetAuthKey(svr.cfg.Token, loginMsg.Timestamp) != loginMsg.PrivilegeKey {
 		err = fmt.Errorf("authorization failed")
 		return
 	}
@@ -361,7 +377,7 @@ func (svr *Service) RegisterControl(ctlConn frpNet.Conn, loginMsg *msg.Login) (e
 		}
 	}
 
-	ctl := NewControl(svr.rc, svr.pxyManager, svr.statsCollector, ctlConn, loginMsg)
+	ctl := NewControl(svr.rc, svr.pxyManager, svr.statsCollector, ctlConn, loginMsg, svr.cfg)
 
 	if oldCtl := svr.ctlManager.Add(loginMsg.RunId, ctl); oldCtl != nil {
 		oldCtl.allShutdown.WaitDone()
